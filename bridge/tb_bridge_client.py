@@ -38,6 +38,8 @@ OP_GET = 2
 OP_DEL = 3
 OP_LIST = 4
 OP_STAT = 5
+OP_COMPUTE = 6
+OP_INFO = 7
 
 _TORCH_TO_NUMPY_DTYPE = {
     "torch.float32": "float32",
@@ -199,6 +201,55 @@ class TBBridgeClient:
         finally:
             sock.close()
 
+    def info(self) -> dict:
+        """Server backend metadata: {'backend': 'mlx'|'bytes', 'mlx_available': bool, ...}"""
+        sock = self._connect()
+        try:
+            _send_exact(sock, bytes([OP_INFO]) + struct.pack(">I", 0))
+            status = _recv_exact(sock, 1)[0]
+            if status != 0:
+                raise RuntimeError(f"INFO failed: {status}")
+            ilen = struct.unpack(">I", _recv_exact(sock, 4))[0]
+            return json.loads(_recv_exact(sock, ilen).decode("utf-8"))
+        finally:
+            sock.close()
+
+    def compute(self, out_key: str, op: str, args: Sequence[str], **kwargs) -> dict:
+        """Execute `op` on the server, against tensor keys in `args`, store
+        the result under `out_key`. Returns the result's metadata (dtype,
+        shape). Fetch the bytes with get(out_key).
+
+        Why this matters: when the server is MLX-backed (Apple Silicon),
+        the computation runs on Metal against tensors that never left
+        unified memory. Linux only sees the final result. The
+        "Mac as attention accelerator" pattern looks like:
+
+            cli.put('q', q); cli.put('k', k); cli.put('v', v)
+            cli.compute('attn_out', 'scaled_dot_product_attention',
+                        ['q', 'k', 'v'], scale=1/64**0.5)
+            result = cli.get('attn_out', device='cuda')
+
+        Supported ops (when MLX backend is active):
+            matmul, softmax, rms_norm, scaled_dot_product_attention,
+            add, mul
+        Numpy fallback supports: matmul, softmax, rms_norm, add, mul
+        """
+        out_key_bytes = out_key.encode("utf-8")
+        expr_bytes = json.dumps({"op": op, "args": list(args), "kwargs": kwargs}).encode("utf-8")
+        sock = self._connect()
+        try:
+            hdr = (bytes([OP_COMPUTE])
+                   + struct.pack(">I", len(out_key_bytes)) + out_key_bytes
+                   + struct.pack(">I", len(expr_bytes)) + expr_bytes)
+            _send_exact(sock, hdr)
+            status = _recv_exact(sock, 1)[0]
+            if status != 0:
+                raise RuntimeError(f"COMPUTE failed: status={status}")
+            meta_len = struct.unpack(">I", _recv_exact(sock, 4))[0]
+            return json.loads(_recv_exact(sock, meta_len).decode("utf-8"))
+        finally:
+            sock.close()
+
     # ── torch ↔ bytes helpers ────────────────────────────────────────────
     def _torch_to_bytes(self, t):
         # Move to CPU and contiguous before serializing
@@ -247,6 +298,7 @@ if __name__ == "__main__":
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
     sub.add_parser("stat")
+    sub.add_parser("info")
     d = sub.add_parser("delete"); d.add_argument("key")
     args = ap.parse_args()
     cli = TBBridgeClient(args.host, args.port)
@@ -256,6 +308,8 @@ if __name__ == "__main__":
     elif args.cmd == "stat":
         s = cli.stat()
         print(f"{s['total_bytes']/1e9:.2f} GB across {s['num_keys']} keys")
+    elif args.cmd == "info":
+        print(json.dumps(cli.info(), indent=2))
     elif args.cmd == "delete":
         ok = cli.delete(args.key)
         print(f"deleted: {ok}")
